@@ -34,7 +34,9 @@ DB_PATH = "angelito.db"
 # Helpers
 # =========================
 def clean_phone(x: str) -> str:
-    """Deja solo dígitos (por si escriben con guiones o espacios)."""
+    return re.sub(r"\D+", "", x or "")
+
+def clean_pin(x: str) -> str:
     return re.sub(r"\D+", "", x or "")
 
 def now_iso():
@@ -44,11 +46,6 @@ def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def generate_derangement(items, max_tries=20000):
-    """
-    Derangement: nadie se asigna a sí mismo.
-    items: lista de teléfonos
-    retorna dict[giver_phone] = receiver_phone
-    """
     items = [i for i in items if i]
     if len(items) < 2:
         raise ValueError("Necesitas al menos 2 participantes.")
@@ -65,6 +62,10 @@ def phone_to_name_map():
 def valid_phones_set():
     return set(phone for _, phone in PARTICIPANTS)
 
+def gen_pin_6():
+    # 6 dígitos
+    return f"{random.randint(0, 999999):06d}"
+
 # =========================
 # DB
 # =========================
@@ -72,10 +73,10 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Si existe una tabla vieja (sin columna phone), la recreamos
+    # si vienes de una tabla vieja sin 'pin', la recreamos
     cur.execute("PRAGMA table_info(participants)")
-    cols = [r[1] for r in cur.fetchall()]  # column names
-    if cols and "phone" not in cols:
+    cols = [r[1] for r in cur.fetchall()]
+    if cols and ("phone" not in cols or "pin" not in cols):
         cur.execute("DROP TABLE participants")
         conn.commit()
 
@@ -83,6 +84,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS participants (
             phone TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            pin TEXT,
             assigned_to_phone TEXT NOT NULL,
             assigned_to_name TEXT NOT NULL,
             registered_at TEXT,
@@ -91,7 +93,6 @@ def init_db():
     """)
     conn.commit()
 
-    # Si la tabla está vacía, sembramos participantes + asignación
     cur.execute("SELECT COUNT(*) FROM participants")
     count = cur.fetchone()[0]
 
@@ -103,12 +104,12 @@ def init_db():
         rows = []
         for giver_phone, receiver_phone in assignment.items():
             rows.append(
-                (giver_phone, p2n[giver_phone], receiver_phone, p2n[receiver_phone], None, None)
+                (giver_phone, p2n[giver_phone], None, receiver_phone, p2n[receiver_phone], None, None)
             )
 
         cur.executemany("""
-            INSERT INTO participants (phone, name, assigned_to_phone, assigned_to_name, registered_at, revealed_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO participants (phone, name, pin, assigned_to_phone, assigned_to_name, registered_at, revealed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         """, rows)
         conn.commit()
 
@@ -118,7 +119,7 @@ def fetch_by_phone(phone: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT phone, name, assigned_to_phone, assigned_to_name, registered_at, revealed_at
+        SELECT phone, name, pin, assigned_to_phone, assigned_to_name, registered_at, revealed_at
         FROM participants
         WHERE phone = ?
     """, (phone,))
@@ -127,15 +128,68 @@ def fetch_by_phone(phone: str):
     return row
 
 def register_phone(phone: str):
+    """
+    Registra si no estaba registrado:
+    - set registered_at si es NULL
+    - genera pin si es NULL
+    Devuelve (name, pin, was_new)
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT name, pin, registered_at
+        FROM participants
+        WHERE phone = ?
+    """, (phone,))
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return None, None, False
+
+    name, pin, registered_at = row
+
+    was_new = registered_at is None
+    if pin is None:
+        pin = gen_pin_6()
+
+    # solo setea si no estaba
+    cur.execute("""
+        UPDATE participants
+        SET
+            registered_at = COALESCE(registered_at, ?),
+            pin = COALESCE(pin, ?)
+        WHERE phone = ?
+    """, (now_iso(), pin, phone))
+
+    conn.commit()
+    conn.close()
+    return name, pin, was_new
+
+def validate_phone_pin(phone: str, pin: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE participants
-        SET registered_at = COALESCE(registered_at, ?)
+        SELECT phone, name, pin, registered_at
+        FROM participants
         WHERE phone = ?
-    """, (now_iso(), phone))
-    conn.commit()
+    """, (phone,))
+    row = cur.fetchone()
     conn.close()
+
+    if not row:
+        return False, None, None, None
+
+    _phone, name, db_pin, registered_at = row
+    if registered_at is None:
+        return False, name, db_pin, registered_at
+
+    # si pin no coincide => no autoriza
+    if db_pin is None or pin != db_pin:
+        return False, name, db_pin, registered_at
+
+    return True, name, db_pin, registered_at
 
 def reveal_assignment(phone: str):
     conn = get_conn()
@@ -184,16 +238,12 @@ def stats():
 # =========================
 st.set_page_config(page_title="Angelito 🎁", page_icon="🎁", layout="centered")
 
-# UI moderna (sin tema navideño)
 st.markdown("""
 <style>
 .stApp{
   background: linear-gradient(180deg, #0b1220 0%, #0e1a2f 60%, #0b1220 100%);
 }
-.block-container{
-  max-width: 900px;
-  padding-top: 2rem;
-}
+.block-container{ max-width: 900px; padding-top: 2rem; }
 h1,h2,h3{ color: #ffffff !important; letter-spacing: .3px; }
 p, label, .stMarkdown, .stTextInput label{
   color: rgba(255,255,255,0.86) !important;
@@ -232,11 +282,10 @@ hr{ border-color: rgba(255,255,255,0.14) !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# Inicializa DB
 init_db()
 
 st.title("Angelito Los Lola 🎁")
-st.write("Regístrate con tu **teléfono** y revela a quién te toca regalar (solo se muestra tu asignación).")
+st.write("Regístrate con tu **teléfono**. Al registrarte se te dará un **PIN**. Para revelar necesitas **teléfono + PIN**.")
 
 total, registered, revealed = stats()
 c1, c2, c3 = st.columns(3)
@@ -246,9 +295,9 @@ c3.metric("Ya revelaron", revealed)
 
 st.divider()
 
-# ===== Registro (por teléfono) =====
+# ===== Registro =====
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("Registro")
+st.subheader("Registro (Teléfono)")
 
 with st.form("registro"):
     phone_input = st.text_input("Tu teléfono (sin guiones):", placeholder="Ej: 8091234567")
@@ -259,22 +308,31 @@ if submit:
     if phone not in valid_phones_set():
         st.error("Ese teléfono no está en la lista de participantes.")
     else:
-        row = fetch_by_phone(phone)
-        if not row:
-            st.error("No pude encontrar tu registro en la base (no debería pasar).")
+        name, pin, was_new = register_phone(phone)
+        if name is None:
+            st.error("No pude encontrarte en la base (no debería pasar).")
         else:
-            register_phone(phone)
-            st.success(f"Listo, **{row[1]}**. Ya estás registrado/a. Ahora puedes revelar tu angelito.")
+            if was_new:
+                st.success(f"Listo, **{name}**. Quedaste registrado/a ✅")
+                st.info(f"🔐 Tu PIN es: **{pin}**  (Guárdalo. Lo necesitarás para revelar.)")
+                st.warning("Este PIN se muestra aquí para que lo copies/guardes. Si lo pierdes, tendrás que pedirlo al organizador.")
+            else:
+                st.success(f"**{name}**, ya estabas registrado/a ✅")
+                st.info("Si no recuerdas tu PIN, pídeselo al organizador (no lo volvemos a mostrar por seguridad).")
+
 st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
 
-# ===== Revelar (por teléfono) =====
+# ===== Revelar =====
 st.markdown('<div class="card">', unsafe_allow_html=True)
-st.subheader("Revelar asignación")
+st.subheader("Revelar asignación (Teléfono + PIN)")
 
-phone_input2 = st.text_input("Para revelar, escribe tu teléfono:", placeholder="Ej: 8091234567")
+phone_input2 = st.text_input("Teléfono:", placeholder="Ej: 8091234567")
+pin_input = st.text_input("PIN (6 dígitos):", placeholder="Ej: 123456", type="password")
+
 phone2 = clean_phone(phone_input2)
+pin2 = clean_pin(pin_input)
 
 colA, colB = st.columns([1, 1])
 with colA:
@@ -289,26 +347,17 @@ if reveal_btn:
     if phone2 not in valid_phones_set():
         st.error("Ese teléfono no está en la lista.")
     else:
-        row = fetch_by_phone(phone2)
-        if not row:
-            st.error("No pude obtener tu registro (no debería pasar).")
+        ok, name, _, registered_at = validate_phone_pin(phone2, pin2)
+        if registered_at is None:
+            st.error("Debes registrarte primero antes de revelar tu asignación.")
+        elif not ok:
+            st.error("PIN incorrecto. Verifica el PIN que te salió al registrarte.")
         else:
-            # row = (phone, name, assigned_to_phone, assigned_to_name, registered_at, revealed_at)
-            your_name = row[1]
-            registered_at = row[4]
-
-            # ✅ BLOQUE NUEVO: si no está registrado, no puede revelar
-            if registered_at is None:
-                st.error("Debes registrarte primero antes de revelar tu asignación.")
-            else:
-                assigned_to_name, revealed_at = reveal_assignment(phone2)
-                if assigned_to_name is None:
-                    st.error("No pude obtener tu asignación. Intenta de nuevo.")
-                else:
-                    st.success(f"✅ **{your_name}**, te tocó regalarle a: **{assigned_to_name}** 🎁")
-                    st.caption(f"Revelado en: {revealed_at}")
+            assigned_to_name, revealed_at = reveal_assignment(phone2)
+            st.success(f"✅ **{name}**, te tocó regalarle a: **{assigned_to_name}** 🎁")
+            st.caption(f"Revelado en: {revealed_at}")
 
 st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
-st.caption("Tip: Si quieres reiniciar el sorteo, borra el archivo angelito.db y vuelve a correr la app.")
+st.caption("Tip: Para reiniciar el sorteo en Streamlit Cloud, reinicia/redeploy la app (la BD se recrea desde cero).")

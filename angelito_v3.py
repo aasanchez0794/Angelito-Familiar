@@ -5,6 +5,15 @@ import random
 import re
 
 # =========================
+# CONFIG
+# =========================
+DB_PATH = "angelito.db"
+
+# ⚠️ RECOMENDADO: en Streamlit Cloud define ADMIN_PASSWORD en Secrets
+# st.secrets["ADMIN_PASSWORD"]
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "ADMIN2026")
+
+# =========================
 # PARTICIPANTES (Nombre -> Teléfono)
 # =========================
 PARTICIPANTS = [
@@ -28,10 +37,8 @@ PARTICIPANTS = [
     ("Yari", "8297683028"),
 ]
 
-DB_PATH = "angelito.db"
-
 # =========================
-# Helpers
+# HELPERS
 # =========================
 def clean_phone(x: str) -> str:
     return re.sub(r"\D+", "", x or "")
@@ -39,32 +46,38 @@ def clean_phone(x: str) -> str:
 def clean_pin(x: str) -> str:
     return re.sub(r"\D+", "", x or "")
 
-def now_iso():
+def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
+
+def gen_pin_6() -> str:
+    return f"{random.randint(0, 999999):06d}"
+
+def valid_phones_set():
+    return set(phone for _, phone in PARTICIPANTS)
+
+def phone_to_name_map():
+    return {phone: name for name, phone in PARTICIPANTS}
 
 def get_conn():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
 def generate_derangement(items, max_tries=20000):
+    """
+    Derangement: nadie se asigna a sí mismo.
+    items: lista de teléfonos
+    retorna dict[giver_phone] = receiver_phone
+    """
     items = [i for i in items if i]
     if len(items) < 2:
         raise ValueError("Necesitas al menos 2 participantes.")
+
     for _ in range(max_tries):
         shuffled = items[:]
         random.shuffle(shuffled)
         if all(a != b for a, b in zip(items, shuffled)):
             return dict(zip(items, shuffled))
+
     raise RuntimeError("No pude generar una asignación válida. Revisa la lista.")
-
-def phone_to_name_map():
-    return {phone: name for name, phone in PARTICIPANTS}
-
-def valid_phones_set():
-    return set(phone for _, phone in PARTICIPANTS)
-
-def gen_pin_6():
-    # 6 dígitos
-    return f"{random.randint(0, 999999):06d}"
 
 # =========================
 # DB
@@ -73,13 +86,17 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # si vienes de una tabla vieja sin 'pin', la recreamos
+    # Verifica si existe tabla y columnas
     cur.execute("PRAGMA table_info(participants)")
-    cols = [r[1] for r in cur.fetchall()]
-    if cols and ("phone" not in cols or "pin" not in cols):
+    cols = [r[1] for r in cur.fetchall()]  # column names
+
+    # Si viene de estructura vieja, recrea
+    required = {"phone", "name", "pin", "assigned_to_phone", "assigned_to_name", "registered_at", "revealed_at"}
+    if cols and not required.issubset(set(cols)):
         cur.execute("DROP TABLE participants")
         conn.commit()
 
+    # Crea tabla si no existe
     cur.execute("""
         CREATE TABLE IF NOT EXISTS participants (
             phone TEXT PRIMARY KEY,
@@ -93,6 +110,7 @@ def init_db():
     """)
     conn.commit()
 
+    # Si está vacía, sembrar
     cur.execute("SELECT COUNT(*) FROM participants")
     count = cur.fetchone()[0]
 
@@ -149,12 +167,12 @@ def register_phone(phone: str):
         return None, None, False
 
     name, pin, registered_at = row
-
     was_new = registered_at is None
+
+    # Si no tiene pin, se crea
     if pin is None:
         pin = gen_pin_6()
 
-    # solo setea si no estaba
     cur.execute("""
         UPDATE participants
         SET
@@ -171,7 +189,7 @@ def validate_phone_pin(phone: str, pin: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        SELECT phone, name, pin, registered_at
+        SELECT name, pin, registered_at
         FROM participants
         WHERE phone = ?
     """, (phone,))
@@ -179,17 +197,19 @@ def validate_phone_pin(phone: str, pin: str):
     conn.close()
 
     if not row:
-        return False, None, None, None
+        return False, None, None
 
-    _phone, name, db_pin, registered_at = row
+    name, db_pin, registered_at = row
+
+    # Debe estar registrado
     if registered_at is None:
-        return False, name, db_pin, registered_at
+        return False, name, "NOT_REGISTERED"
 
-    # si pin no coincide => no autoriza
+    # Pin debe coincidir
     if db_pin is None or pin != db_pin:
-        return False, name, db_pin, registered_at
+        return False, name, "BAD_PIN"
 
-    return True, name, db_pin, registered_at
+    return True, name, "OK"
 
 def reveal_assignment(phone: str):
     conn = get_conn()
@@ -201,6 +221,7 @@ def reveal_assignment(phone: str):
         WHERE phone = ?
     """, (phone,))
     row = cur.fetchone()
+
     if not row:
         conn.close()
         return None, None
@@ -232,6 +253,42 @@ def stats():
     conn.close()
     return total, registered, revealed
 
+# =========================
+# ADMIN FUNCTIONS
+# =========================
+def get_pin_by_phone(phone: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT name, pin, registered_at FROM participants WHERE phone = ?", (phone,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def reset_pin(phone: str):
+    new_pin = gen_pin_6()
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE participants SET pin = ? WHERE phone = ?", (new_pin, phone))
+    conn.commit()
+    conn.close()
+    return new_pin
+
+def admin_overview_rows():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            name,
+            phone,
+            registered_at,
+            revealed_at,
+            assigned_to_name
+        FROM participants
+        ORDER BY name
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return rows
 
 # =========================
 # UI
@@ -282,6 +339,7 @@ hr{ border-color: rgba(255,255,255,0.14) !important; }
 </style>
 """, unsafe_allow_html=True)
 
+# init
 init_db()
 
 st.title("Angelito Los Lola 🎁")
@@ -315,10 +373,10 @@ if submit:
             if was_new:
                 st.success(f"Listo, **{name}**. Quedaste registrado/a ✅")
                 st.info(f"🔐 Tu PIN es: **{pin}**  (Guárdalo. Lo necesitarás para revelar.)")
-                st.warning("Este PIN se muestra aquí para que lo copies/guardes. Si lo pierdes, tendrás que pedirlo al organizador.")
+                st.warning("Este PIN se muestra aquí SOLO una vez para que lo copies. Si lo pierdes, pídeselo al organizador.")
             else:
                 st.success(f"**{name}**, ya estabas registrado/a ✅")
-                st.info("Si no recuerdas tu PIN, pídeselo al organizador (no lo volvemos a mostrar por seguridad).")
+                st.info("Si no recuerdas tu PIN, pídeselo al organizador (no se vuelve a mostrar por seguridad).")
 
 st.markdown('</div>', unsafe_allow_html=True)
 
@@ -347,11 +405,14 @@ if reveal_btn:
     if phone2 not in valid_phones_set():
         st.error("Ese teléfono no está en la lista.")
     else:
-        ok, name, _, registered_at = validate_phone_pin(phone2, pin2)
-        if registered_at is None:
+        ok, name, status = validate_phone_pin(phone2, pin2)
+
+        if status == "NOT_REGISTERED":
             st.error("Debes registrarte primero antes de revelar tu asignación.")
-        elif not ok:
+        elif status == "BAD_PIN":
             st.error("PIN incorrecto. Verifica el PIN que te salió al registrarte.")
+        elif not ok:
+            st.error("No pude validar. Intenta de nuevo.")
         else:
             assigned_to_name, revealed_at = reveal_assignment(phone2)
             st.success(f"✅ **{name}**, te tocó regalarle a: **{assigned_to_name}** 🎁")
@@ -360,4 +421,65 @@ if reveal_btn:
 st.markdown('</div>', unsafe_allow_html=True)
 
 st.divider()
-st.caption("Tip: Para reiniciar el sorteo en Streamlit Cloud, reinicia/redeploy la app (la BD se recrea desde cero).")
+
+# ===== Modo organizador =====
+with st.expander("🔐 Modo organizador (solo para el organizador)"):
+    admin_pass = st.text_input("Clave del organizador", type="password")
+    is_admin = (admin_pass == ADMIN_PASSWORD)
+
+    st.markdown("### Acciones")
+    phone_admin = clean_phone(st.text_input("Teléfono del participante (para PIN)"))
+
+    col1, col2 = st.columns(2)
+
+    if col1.button("👁️ Ver PIN"):
+        if not is_admin:
+            st.error("Clave incorrecta.")
+        elif not phone_admin:
+            st.error("Escribe un teléfono.")
+        else:
+            row = get_pin_by_phone(phone_admin)
+            if not row:
+                st.error("Teléfono no encontrado.")
+            else:
+                name, pin, registered_at = row
+                if registered_at is None:
+                    st.warning(f"**{name}** aún no se ha registrado.")
+                st.success(f"PIN de **{name}**: **{pin}**")
+
+    if col2.button("♻️ Generar PIN nuevo"):
+        if not is_admin:
+            st.error("Clave incorrecta.")
+        elif not phone_admin:
+            st.error("Escribe un teléfono.")
+        else:
+            row = get_pin_by_phone(phone_admin)
+            if not row:
+                st.error("Teléfono no encontrado.")
+            else:
+                name, _, _ = row
+                new_pin = reset_pin(phone_admin)
+                st.success(f"Nuevo PIN para **{name}**: **{new_pin}**")
+                st.warning("Comparte este PIN solo con esa persona.")
+
+    st.markdown("---")
+    st.markdown("### Estado del sorteo")
+
+    if is_admin:
+        rows = admin_overview_rows()
+        # tabla simple sin pandas
+        st.write("**Registrados / Revelados / Asignación (solo organizador):**")
+        st.dataframe(
+            [{
+                "Nombre": r[0],
+                "Teléfono": r[1],
+                "Registrado": "Sí" if r[2] else "No",
+                "Reveló": "Sí" if r[3] else "No",
+                "Le regala a": r[4],
+            } for r in rows],
+            use_container_width=True
+        )
+    else:
+        st.info("Introduce la clave correcta para ver el estado completo.")
+
+st.caption("Tip: Para reiniciar el sorteo, elimina el archivo angelito.db (en local) o borra los datos del storage en el hosting y redeploy.")
